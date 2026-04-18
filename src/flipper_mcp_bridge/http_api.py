@@ -10,8 +10,10 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse
 from starlette.routing import Route
 
-from .flipper import FlipperCLI, FlipperError
+from .flipper import FlipperCLI, FlipperError, InvalidInputError
 from .ir import button_summary, parse_ir_file
+
+MAX_BODY_BYTES = 64 * 1024  # generous for .ir file content; rejects obvious abuse.
 
 
 def _err(status: int, message: str) -> JSONResponse:
@@ -19,23 +21,45 @@ def _err(status: int, message: str) -> JSONResponse:
 
 
 async def _body_json(request: Request) -> dict:
-    raw = await request.body()
+    # Cap the body read so a LAN caller can't send an endless stream.
+    size = 0
+    chunks = []
+    async for chunk in request.stream():
+        size += len(chunk)
+        if size > MAX_BODY_BYTES:
+            raise InvalidInputError(f"request body exceeds {MAX_BODY_BYTES} bytes")
+        chunks.append(chunk)
+    raw = b"".join(chunks)
     if not raw:
         return {}
     try:
         data = json.loads(raw)
     except json.JSONDecodeError as e:
-        raise FlipperError(f"invalid JSON body: {e}")
+        raise InvalidInputError(f"invalid JSON body: {e}")
     if not isinstance(data, dict):
-        raise FlipperError("JSON body must be an object")
+        raise InvalidInputError("JSON body must be an object")
     return data
 
 
-def _require(data: dict, *fields: str) -> tuple:
-    missing = [f for f in fields if f not in data]
-    if missing:
-        raise FlipperError(f"missing required fields: {missing}")
-    return tuple(data[f] for f in fields)
+def _require_str(data: dict, field: str) -> str:
+    if field not in data:
+        raise InvalidInputError(f"missing required field: {field}")
+    value = data[field]
+    if not isinstance(value, str):
+        raise InvalidInputError(f"field {field} must be a string, got {type(value).__name__}")
+    return value
+
+
+def _optional_float(data: dict, field: str, default: float, low: float, high: float) -> float:
+    if field not in data or data[field] is None:
+        return default
+    v = data[field]
+    if not isinstance(v, (int, float)) or isinstance(v, bool):
+        raise InvalidInputError(f"field {field} must be a number")
+    v = float(v)
+    if not (low <= v <= high):
+        raise InvalidInputError(f"field {field} must be in [{low}, {high}]")
+    return v
 
 
 async def health(request: Request) -> JSONResponse:
@@ -77,11 +101,9 @@ async def ir_buttons(request: Request) -> JSONResponse:
 
 
 async def ir_send_button(request: Request) -> JSONResponse:
-    try:
-        data = await _body_json(request)
-        file, button = _require(data, "file", "button")
-    except FlipperError as e:
-        return _err(400, str(e))
+    data = await _body_json(request)
+    file = _require_str(data, "file")
+    button = _require_str(data, "button")
     with FlipperCLI() as f:
         text = f.storage_read(file)
         buttons = parse_ir_file(text)
@@ -98,22 +120,19 @@ async def ir_send_button(request: Request) -> JSONResponse:
 
 
 async def ir_send_signal(request: Request) -> JSONResponse:
-    try:
-        data = await _body_json(request)
-        protocol, address, command = _require(data, "protocol", "address", "command")
-    except FlipperError as e:
-        return _err(400, str(e))
+    data = await _body_json(request)
+    protocol = _require_str(data, "protocol")
+    address = _require_str(data, "address")
+    command = _require_str(data, "command")
     with FlipperCLI() as f:
         f.ir_tx_direct(protocol, address, command)
     return JSONResponse({"ok": True, "protocol": protocol, "address": address, "command": command})
 
 
 async def ir_universal_send(request: Request) -> JSONResponse:
-    try:
-        data = await _body_json(request)
-        remote, signal = _require(data, "remote", "signal")
-    except FlipperError as e:
-        return _err(400, str(e))
+    data = await _body_json(request)
+    remote = _require_str(data, "remote")
+    signal = _require_str(data, "signal")
     with FlipperCLI() as f:
         f.ir_universal_send(remote, signal)
     return JSONResponse({"ok": True, "remote": remote, "signal": signal})
@@ -128,30 +147,30 @@ async def ir_universal_list(request: Request) -> JSONResponse:
 
 
 async def ir_delete_button(request: Request) -> JSONResponse:
-    try:
-        data = await _body_json(request)
-        file, button = _require(data, "file", "button")
-    except FlipperError as e:
-        return _err(400, str(e))
+    data = await _body_json(request)
+    file = _require_str(data, "file")
+    button = _require_str(data, "button")
     with FlipperCLI() as f:
         return JSONResponse(f.ir_delete_button(file, button))
 
 
 async def ir_learn(request: Request) -> JSONResponse:
-    try:
-        data = await _body_json(request)
-        file, button = _require(data, "file", "button")
-    except FlipperError as e:
-        return _err(400, str(e))
-    timeout = float(data.get("timeout_seconds", 30.0))
+    data = await _body_json(request)
+    file = _require_str(data, "file")
+    button = _require_str(data, "button")
+    timeout = _optional_float(data, "timeout_seconds", default=30.0, low=1.0, high=300.0)
     with FlipperCLI() as f:
         result = f.ir_learn_and_save(file, button, timeout=timeout)
     return JSONResponse({"ok": True, **result})
 
 
 async def error_handler(request: Request, exc: Exception) -> JSONResponse:
-    status = 400 if isinstance(exc, FlipperError) else 500
-    return _err(status, str(exc))
+    # InvalidInputError → 4xx; operational FlipperError → 503; anything else → 500.
+    if isinstance(exc, InvalidInputError):
+        return _err(400, str(exc))
+    if isinstance(exc, FlipperError):
+        return _err(503, str(exc))
+    return _err(500, str(exc))
 
 
 def create_app() -> Starlette:
@@ -170,6 +189,7 @@ def create_app() -> Starlette:
     return Starlette(
         routes=routes,
         exception_handlers={
+            InvalidInputError: error_handler,
             FlipperError: error_handler,
             Exception: error_handler,
         },
@@ -177,5 +197,14 @@ def create_app() -> Starlette:
 
 
 def run_http(host: str = "127.0.0.1", port: int = 8765) -> None:
+    import sys
     import uvicorn
+    if host not in ("127.0.0.1", "localhost", "::1"):
+        print(
+            f"\n*** WARNING: binding HTTP API to {host}:{port} — this exposes IR send, "
+            "IR learn, and .ir file delete endpoints to any reachable host on that "
+            "interface with NO authentication. v1 has no auth layer by design; only do "
+            "this on a trusted LAN.\n",
+            file=sys.stderr,
+        )
     uvicorn.run(create_app(), host=host, port=port, log_level="info")

@@ -2,11 +2,32 @@ from __future__ import annotations
 
 import os
 import re
+import threading
 import time
 from dataclasses import dataclass
 
 import serial
 from serial.tools import list_ports
+
+# Single-process lock: all CLI sessions serialize through this so concurrent MCP tool
+# calls, HTTP requests, and scripts can't interleave on one Flipper's serial port.
+_SESSION_LOCK = threading.Lock()
+
+
+def _reject_cli_unsafe(value: object, field: str, max_len: int = 512) -> str:
+    """Validate a user-supplied string before it's interpolated into a Flipper CLI command.
+    Rejects non-strings, control characters (CR/LF/NUL would let a caller inject extra
+    commands over the line-based CLI), and unreasonable lengths."""
+    if not isinstance(value, str):
+        raise InvalidInputError(f"{field}: must be a string, got {type(value).__name__}")
+    if not value:
+        raise InvalidInputError(f"{field}: must not be empty")
+    if len(value) > max_len:
+        raise InvalidInputError(f"{field}: too long (max {max_len} chars)")
+    for c in value:
+        if ord(c) < 0x20 or c == "\x7f":
+            raise InvalidInputError(f"{field}: contains control character")
+    return value
 
 IR_RX_LINE_RE = re.compile(r"(\w+),\s*A:0x([0-9A-Fa-f]+),\s*C:0x([0-9A-Fa-f]+)")
 # Anchored form: matches only a fully-transmitted signal line (ends with newline),
@@ -109,7 +130,12 @@ def _int_hex_to_file_bytes(int_hex: str, total_bytes: int = 4) -> str:
 
 
 class FlipperError(RuntimeError):
-    pass
+    """Operational failure (device, FS, serial). Maps to 5xx over HTTP."""
+
+
+class InvalidInputError(FlipperError):
+    """Client-supplied input was invalid (missing field, wrong type, control chars, etc.).
+    Maps to 4xx over HTTP so callers can distinguish their bugs from device issues."""
 
 
 @dataclass
@@ -127,14 +153,26 @@ class FlipperCLI:
         self._ser: serial.Serial | None = None
 
     def __enter__(self) -> "FlipperCLI":
-        self.open()
+        # Serialize all sessions through a process-level lock so concurrent callers
+        # (HTTP requests, MCP tool calls, scripts) don't interleave on the serial port.
+        _SESSION_LOCK.acquire()
+        try:
+            self.open()
+        except Exception:
+            _SESSION_LOCK.release()
+            raise
         return self
 
     def __exit__(self, *exc) -> None:
-        self.close()
+        try:
+            self.close()
+        finally:
+            _SESSION_LOCK.release()
 
     def open(self) -> None:
-        self._ser = serial.Serial(self.port, self.baudrate, timeout=0.1)
+        # exclusive=True gets an OS-level advisory lock so a second PROCESS opening the
+        # same tty also fails fast instead of silently cross-talking.
+        self._ser = serial.Serial(self.port, self.baudrate, timeout=0.1, exclusive=True)
         # Drain any banner / pending output by waiting for quiescence (no bytes for ~200ms).
         # Cheaper and more robust than matching the prompt against the banner's ASCII art.
         quiet_deadline = time.monotonic() + 0.2
@@ -169,8 +207,11 @@ class FlipperCLI:
         raise FlipperError(f"timeout waiting for prompt; got: {bytes(buf)!r}")
 
     def command(self, cmd: str, timeout: float | None = None) -> str:
-        """Send a CLI command, return the response text (echo + prompt stripped)."""
+        """Send a CLI command, return the response text (echo + prompt stripped).
+        Rejects embedded CR/LF/NUL so a caller can't smuggle in extra CLI commands."""
         assert self._ser is not None, "call open() first"
+        if any(c in cmd for c in ("\r", "\n", "\x00")):
+            raise FlipperError(f"CLI command contains control characters: {cmd!r}")
         self._ser.reset_input_buffer()
         self._ser.write((cmd + "\r\n").encode("utf-8"))
         raw = self._read_until_prompt(timeout=timeout)
@@ -199,6 +240,7 @@ class FlipperCLI:
         return info
 
     def storage_list(self, path: str) -> list[StorageEntry]:
+        _reject_cli_unsafe(path, "path")
         out = self.command(f"storage list {path}")
         entries: list[StorageEntry] = []
         for line in out.splitlines():
@@ -221,17 +263,20 @@ class FlipperCLI:
         return entries
 
     def storage_exists(self, path: str) -> bool:
+        _reject_cli_unsafe(path, "path")
         out = self.command(f"storage stat {path}", timeout=2.0)
         # Success looks like "File, size: N" or "Directory"; failure includes "error"/"not exist".
         return "error" not in out.lower() and "not exist" not in out.lower()
 
     def storage_remove(self, path: str) -> None:
+        _reject_cli_unsafe(path, "path")
         out = self.command(f"storage remove {path}", timeout=3.0).strip()
         if out and "error" in out.lower():
             raise FlipperError(f"storage remove failed: {out}")
 
     def storage_read(self, path: str) -> str:
         """Return file contents as text. Strips the 'Size: N' header Flipper prepends."""
+        _reject_cli_unsafe(path, "path")
         out = self.command(f"storage read {path}", timeout=5.0)
         lines = out.split("\n")
         # First line is "Size: NNN"
@@ -326,6 +371,7 @@ class FlipperCLI:
         """Append text content to a file on the SD card using `storage write` (Ctrl+C to stop).
         If the write command errors before entering input mode (e.g. bad path), raises rather
         than silently discarding the error and sending content into the void."""
+        _reject_cli_unsafe(path, "path")
         assert self._ser is not None
         self._ser.reset_input_buffer()
         self._ser.write(f"storage write {path}\r\n".encode("utf-8"))
@@ -359,6 +405,12 @@ class FlipperCLI:
     ) -> dict:
         """Capture one IR signal and append it as a named button to an .ir file.
         Creates the file with the standard header if it doesn't exist yet."""
+        _reject_cli_unsafe(file, "file")
+        # Button name is written into the .ir file (`name: {x}`) — newlines would inject
+        # extra lines and forge fake buttons; also a colon would break the key:value format.
+        _reject_cli_unsafe(button_name, "button", max_len=128)
+        if ":" in button_name:
+            raise InvalidInputError("button: must not contain ':'")
         captured = self.ir_rx_one(timeout=timeout)
         m = IR_RX_LINE_RE.match(captured)
         if not m:
@@ -388,10 +440,20 @@ class FlipperCLI:
             "raw_capture": captured,
         }
 
+    def _storage_remove_if_exists(self, path: str) -> None:
+        try:
+            self.storage_remove(path)
+        except FlipperError:
+            pass
+
     def ir_delete_button(self, file: str, button_name: str) -> dict:
-        """Remove a named button from an .ir file. Reads, filters, writes back."""
+        """Remove a named button from an .ir file. Backup → rewrite → cleanup. If the
+        rewrite fails at any step, restore the original from the backup so the user's
+        file is never lost."""
         from .ir import parse_ir_file  # local import to avoid a module cycle
 
+        _reject_cli_unsafe(file, "file")
+        _reject_cli_unsafe(button_name, "button", max_len=128)
         text = self.storage_read(file)
         buttons = parse_ir_file(text)
         if not any(b.name == button_name for b in buttons):
@@ -412,8 +474,26 @@ class FlipperCLI:
                     f"frequency: {b.frequency}\nduty_cycle: {b.duty_cycle}\ndata: {data}\n"
                 )
         new_content = "".join(parts)
-        self.storage_remove(file)
-        self.storage_append(file, new_content)
+
+        backup = file + ".bak"
+        self._storage_remove_if_exists(backup)
+        copy_out = self.command(f"storage copy {file} {backup}", timeout=5.0).strip()
+        if copy_out and "error" in copy_out.lower():
+            raise FlipperError(f"backup copy failed: {copy_out}")
+        try:
+            self.storage_remove(file)
+            self.storage_append(file, new_content)
+        except Exception:
+            # Roll back: wipe any partial rewrite, then restore from backup.
+            self._storage_remove_if_exists(file)
+            restore_out = self.command(f"storage rename {backup} {file}", timeout=3.0).strip()
+            if restore_out and "error" in restore_out.lower():
+                raise FlipperError(
+                    f"delete failed AND restore from {backup} failed: {restore_out}. "
+                    "Your original file is at the backup path on the SD card."
+                )
+            raise
+        self._storage_remove_if_exists(backup)
         return {"file": file, "deleted": button_name, "remaining": [b.name for b in kept]}
 
     def ir_universal_remotes(self) -> list[str]:
@@ -426,12 +506,24 @@ class FlipperCLI:
         return []
 
     def ir_universal_signals(self, remote: str) -> list[str]:
-        """Return the signal names known for a universal remote (e.g. 'POWER', 'VOL+')."""
+        """Return the signal names known for a universal remote (e.g. 'POWER', 'VOL+').
+        Raises FlipperError if the firmware response looks like an error/usage dump rather
+        than a signal list."""
+        _reject_cli_unsafe(remote, "remote", max_len=64)
         out = self.command(f"ir universal list {remote}", timeout=3.0)
-        return [line.strip() for line in out.splitlines() if line.strip()]
+        lines = [line.strip() for line in out.splitlines() if line.strip()]
+        # Error/usage output from the firmware usually contains one of these — treat as
+        # "parser couldn't understand the response" rather than returning garbage as signals.
+        joined_low = "\n".join(lines).lower()
+        if any(tok in joined_low for tok in ("wrong arguments", "usage:", "available universal remotes")):
+            raise FlipperError(f"ir universal list {remote!r} failed: {out.strip()}")
+        # Firmware prepends a header line like "Valid signals:" — drop header-ish lines.
+        return [ln for ln in lines if not ln.endswith(":")]
 
     def ir_universal_send(self, remote: str, signal: str) -> str:
         """Transmit a named signal from a built-in universal remote."""
+        _reject_cli_unsafe(remote, "remote", max_len=64)
+        _reject_cli_unsafe(signal, "signal", max_len=128)
         return self._tx_with_recovery(f"ir universal {remote} {signal}")
 
     def ir_tx_raw(self, frequency: int, duty_cycle: int, samples: list[int]) -> str:

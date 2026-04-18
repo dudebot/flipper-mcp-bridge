@@ -98,7 +98,18 @@ Endpoints:
 
 ## Home Assistant integration
 
-Run the bridge on a host on the same LAN as HA (or locally on the HA host). Then drop this into `configuration.yaml`:
+### Deployment note: reachability from HA
+
+HA needs to be able to HTTP to the bridge. Two easy setups work out of the box:
+
+1. **Run the bridge on the same host as HA** (Pi/NUC/server with Flipper plugged in). HA hits `http://127.0.0.1:8765`. Simplest.
+2. **Run the bridge on any always-on Linux host on the LAN**. Start it with `--host 0.0.0.0` (the CLI prints a warning — there's no auth in v1, so only do this on a trusted LAN). HA hits `http://HOST:8765`.
+
+**WSL2 caveat**: WSL2 uses NAT — the WSL IP isn't reachable from other hosts on the LAN. Running the bridge inside WSL2 and expecting HA on a different device to reach it requires `netsh interface portproxy` port-forwarding on the Windows host, or running the bridge on the Windows host directly (Python + pyserial work fine on Windows).
+
+### Configuration
+
+Drop this into `configuration.yaml`:
 
 ```yaml
 rest_command:
