@@ -49,8 +49,8 @@ check_raises(lambda: _int_hex_to_file_bytes("FFFFFFFFFF", 4), ValueError, "int2f
 check(_normalize_int_hex("DF02", 2) == "DF02", "normalize 2-byte pass-through")
 check(_normalize_int_hex("4", 1) == "04", "normalize left-pad 1-byte")
 check(_normalize_int_hex("0x04", 1) == "04", "normalize 0x prefix")
-check_raises(lambda: _normalize_int_hex("", 2), ValueError, "normalize rejects empty")
-check_raises(lambda: _normalize_int_hex("12345", 2), ValueError, "normalize rejects oversize")
+check_raises(lambda: _normalize_int_hex("", 2), InvalidInputError, "normalize rejects empty")
+check_raises(lambda: _normalize_int_hex("12345", 2), InvalidInputError, "normalize rejects oversize")
 
 # _reject_cli_unsafe: CRLF injection guard.
 check(_reject_cli_unsafe("/ext/infrared/Remote.ir", "path") == "/ext/infrared/Remote.ir", "cli-safe ok")

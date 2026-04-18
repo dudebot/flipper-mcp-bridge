@@ -101,17 +101,19 @@ def _shrink_hex(value: str, n_bytes: int) -> str:
     return "".join(head[i:i+2] for i in range(want - 2, -1, -2))
 
 
-def _normalize_int_hex(value: str, n_bytes: int) -> str:
+def _normalize_int_hex(value: str, n_bytes: int, field: str = "value") -> str:
     """Normalize a user-supplied MSB-first hex string ('0xDF02', 'df02', 'DF 02')
     to the exact width `ir tx` expects. Unlike _shrink_hex this does NOT byte-swap."""
+    if not isinstance(value, str):
+        raise InvalidInputError(f"{field}: must be a string")
     v = value.strip().lower().replace(" ", "")
     if v.startswith("0x"):
         v = v[2:]
     if not v or any(c not in "0123456789abcdef" for c in v):
-        raise ValueError(f"invalid hex value: {value!r}")
+        raise InvalidInputError(f"{field}: invalid hex value: {value!r}")
     want = n_bytes * 2
     if len(v) > want:
-        raise ValueError(f"value too large for {n_bytes}-byte field: {value!r}")
+        raise InvalidInputError(f"{field}: value too large for {n_bytes}-byte field: {value!r}")
     return v.zfill(want).upper()
 
 
@@ -159,6 +161,9 @@ class FlipperCLI:
         try:
             self.open()
         except Exception:
+            # Close any partially-opened port so the exclusive fd isn't stranded
+            # (would otherwise wedge the device until process exit).
+            self.close()
             _SESSION_LOCK.release()
             raise
         return self
@@ -306,20 +311,27 @@ class FlipperCLI:
         """Transmit a parsed IR signal from .ir file fields (LSB-first zero-padded bytes).
         Converts them to the MSB-first integer hex the CLI expects."""
         if protocol not in PROTOCOL_WIDTHS:
-            raise FlipperError(f"unknown protocol {protocol!r}; known: {sorted(PROTOCOL_WIDTHS)}")
+            raise InvalidInputError(
+                f"unknown protocol {protocol!r}; known: {sorted(PROTOCOL_WIDTHS)}"
+            )
         addr_bytes, cmd_bytes = PROTOCOL_WIDTHS[protocol]
-        addr = _shrink_hex(address, addr_bytes)
-        cmd = _shrink_hex(command, cmd_bytes)
+        try:
+            addr = _shrink_hex(address, addr_bytes)
+            cmd = _shrink_hex(command, cmd_bytes)
+        except ValueError as e:
+            raise InvalidInputError(str(e)) from e
         return self._tx_with_recovery(f"ir tx {protocol} {addr} {cmd}")
 
     def ir_tx_direct(self, protocol: str, address_int_hex: str, command_int_hex: str) -> str:
         """Transmit a parsed IR signal from MSB-first integer hex (as `ir rx` reports).
         No byte-swapping. Use for ad-hoc sends where you have the integer value."""
         if protocol not in PROTOCOL_WIDTHS:
-            raise FlipperError(f"unknown protocol {protocol!r}; known: {sorted(PROTOCOL_WIDTHS)}")
+            raise InvalidInputError(
+                f"unknown protocol {protocol!r}; known: {sorted(PROTOCOL_WIDTHS)}"
+            )
         addr_bytes, cmd_bytes = PROTOCOL_WIDTHS[protocol]
-        addr = _normalize_int_hex(address_int_hex, addr_bytes)
-        cmd = _normalize_int_hex(command_int_hex, cmd_bytes)
+        addr = _normalize_int_hex(address_int_hex, addr_bytes, field="address")
+        cmd = _normalize_int_hex(command_int_hex, cmd_bytes, field="command")
         return self._tx_with_recovery(f"ir tx {protocol} {addr} {cmd}")
 
     def ir_rx_one(self, timeout: float = 30.0) -> str:
@@ -483,15 +495,21 @@ class FlipperCLI:
         try:
             self.storage_remove(file)
             self.storage_append(file, new_content)
-        except Exception:
-            # Roll back: wipe any partial rewrite, then restore from backup.
+        except Exception as delete_exc:
+            # Roll back: wipe any partial rewrite, then restore from backup. If the
+            # restore itself blows up (disconnect, timeout, FS error), surface the
+            # backup path so the user can recover manually.
             self._storage_remove_if_exists(file)
-            restore_out = self.command(f"storage rename {backup} {file}", timeout=3.0).strip()
-            if restore_out and "error" in restore_out.lower():
+            try:
+                restore_out = self.command(f"storage rename {backup} {file}", timeout=3.0).strip()
+                if restore_out and "error" in restore_out.lower():
+                    raise FlipperError(restore_out)
+            except Exception as restore_exc:
                 raise FlipperError(
-                    f"delete failed AND restore from {backup} failed: {restore_out}. "
-                    "Your original file is at the backup path on the SD card."
-                )
+                    f"delete failed ({delete_exc}) AND restore failed ({restore_exc}). "
+                    f"Your original file is preserved at {backup} on the SD card — "
+                    f"rename it back manually."
+                ) from delete_exc
             raise
         self._storage_remove_if_exists(backup)
         return {"file": file, "deleted": button_name, "remaining": [b.name for b in kept]}
