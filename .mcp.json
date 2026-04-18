@@ -1,0 +1,8 @@
+{
+  "mcpServers": {
+    "flipper": {
+      "command": "sg",
+      "args": ["dialout", "-c", "uv run flipper-mcp-bridge"]
+    }
+  }
+}
