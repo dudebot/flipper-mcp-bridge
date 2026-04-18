@@ -225,6 +225,11 @@ class FlipperCLI:
         # Success looks like "File, size: N" or "Directory"; failure includes "error"/"not exist".
         return "error" not in out.lower() and "not exist" not in out.lower()
 
+    def storage_remove(self, path: str) -> None:
+        out = self.command(f"storage remove {path}", timeout=3.0).strip()
+        if out and "error" in out.lower():
+            raise FlipperError(f"storage remove failed: {out}")
+
     def storage_read(self, path: str) -> str:
         """Return file contents as text. Strips the 'Size: N' header Flipper prepends."""
         out = self.command(f"storage read {path}", timeout=5.0)
@@ -382,6 +387,52 @@ class FlipperCLI:
             "command": cmd_file,
             "raw_capture": captured,
         }
+
+    def ir_delete_button(self, file: str, button_name: str) -> dict:
+        """Remove a named button from an .ir file. Reads, filters, writes back."""
+        from .ir import parse_ir_file  # local import to avoid a module cycle
+
+        text = self.storage_read(file)
+        buttons = parse_ir_file(text)
+        if not any(b.name == button_name for b in buttons):
+            raise FlipperError(f"button {button_name!r} not found in {file}")
+        kept = [b for b in buttons if b.name != button_name]
+        # Rebuild the file in the canonical format.
+        parts = ["Filetype: IR signals file\nVersion: 1\n"]
+        for b in kept:
+            if b.type == "parsed":
+                parts.append(
+                    f"#\nname: {b.name}\ntype: parsed\n"
+                    f"protocol: {b.protocol}\naddress: {b.address}\ncommand: {b.command}\n"
+                )
+            else:
+                data = " ".join(str(x) for x in b.data)
+                parts.append(
+                    f"#\nname: {b.name}\ntype: raw\n"
+                    f"frequency: {b.frequency}\nduty_cycle: {b.duty_cycle}\ndata: {data}\n"
+                )
+        new_content = "".join(parts)
+        self.storage_remove(file)
+        self.storage_append(file, new_content)
+        return {"file": file, "deleted": button_name, "remaining": [b.name for b in kept]}
+
+    def ir_universal_remotes(self) -> list[str]:
+        """Return the built-in universal remote names the firmware exposes (ac, tv, ...)."""
+        out = self.command("ir help")
+        for line in out.splitlines():
+            if "Available universal remotes:" in line:
+                _, _, rest = line.partition(":")
+                return [r.strip() for r in rest.split() if r.strip()]
+        return []
+
+    def ir_universal_signals(self, remote: str) -> list[str]:
+        """Return the signal names known for a universal remote (e.g. 'POWER', 'VOL+')."""
+        out = self.command(f"ir universal list {remote}", timeout=3.0)
+        return [line.strip() for line in out.splitlines() if line.strip()]
+
+    def ir_universal_send(self, remote: str, signal: str) -> str:
+        """Transmit a named signal from a built-in universal remote."""
+        return self._tx_with_recovery(f"ir universal {remote} {signal}")
 
     def ir_tx_raw(self, frequency: int, duty_cycle: int, samples: list[int]) -> str:
         if not (10000 <= frequency <= 56000):

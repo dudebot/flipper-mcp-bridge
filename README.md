@@ -13,6 +13,9 @@ Tested against **Momentum firmware (mntm-008)**. Any recent Flipper fork with th
 | `list_ir_buttons` | Parse a saved `.ir` file and return its buttons |
 | `send_ir_button` | Transmit a named button from a saved `.ir` file |
 | `send_ir_signal` | Transmit an ad-hoc parsed IR signal by MSB-first integer hex (e.g. `NECext DF02 EE11`) |
+| `list_universal_remotes` | List built-in universal IR remotes available on the firmware (ac, tv, fans, ...) |
+| `list_universal_signals` | List the signal names for a built-in universal remote |
+| `send_universal_signal` | Transmit a named signal from a built-in universal remote |
 | `learn_ir_button` | Put the Flipper in RX, capture the next remote press, append it to a `.ir` file |
 
 ## Setup (Windows host, WSL2)
@@ -67,11 +70,59 @@ You should see device info, a list of files under `/ext/infrared/`, and parsed c
 
 ## Running
 
-Standalone stdio:
+MCP stdio (for Claude Code, Cursor, etc.):
 
 ```bash
 uv run flipper-mcp-bridge
 ```
+
+HTTP REST API (for Home Assistant, `curl`, scripts):
+
+```bash
+uv run flipper-mcp-bridge --http --port 8765
+```
+
+Endpoints:
+
+| Method | Path | Body / Query |
+|---|---|---|
+| `GET` | `/health` | — |
+| `GET` | `/device` | — |
+| `GET` | `/ir/files` | `?dir=/ext/infrared` |
+| `GET` | `/ir/buttons` | `?file=/ext/infrared/Remote.ir` |
+| `POST` | `/ir/send-button` | `{"file": "...", "button": "..."}` |
+| `POST` | `/ir/send-signal` | `{"protocol": "...", "address": "...", "command": "..."}` |
+| `GET` | `/ir/universal/list` | `?remote=ac` (omit to list available remotes) |
+| `POST` | `/ir/universal/send` | `{"remote": "ac", "signal": "OFF"}` |
+| `POST` | `/ir/learn` | `{"file": "...", "button": "...", "timeout_seconds": 30}` |
+
+## Home Assistant integration
+
+Run the bridge on a host on the same LAN as HA (or locally on the HA host). Then drop this into `configuration.yaml`:
+
+```yaml
+rest_command:
+  flipper_humidifier_toggle:
+    url: "http://FLIPPER_HOST:8765/ir/send-button"
+    method: POST
+    content_type: "application/json"
+    payload: '{"file":"/ext/infrared/Remote.ir","button":"Humid"}'
+
+  flipper_ac_off:
+    url: "http://FLIPPER_HOST:8765/ir/universal/send"
+    method: POST
+    content_type: "application/json"
+    payload: '{"remote":"ac","signal":"OFF"}'
+```
+
+Then in automations or scripts:
+
+```yaml
+action:
+  - service: rest_command.flipper_humidifier_toggle
+```
+
+For a switch-like entity, use a RESTful switch pointed at the same `/ir/send-button` endpoint (state is maintained by HA since the Flipper itself doesn't expose device state).
 
 ## Port selection
 

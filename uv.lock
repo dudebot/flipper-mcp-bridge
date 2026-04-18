@@ -225,12 +225,16 @@ source = { editable = "." }
 dependencies = [
     { name = "mcp" },
     { name = "pyserial" },
+    { name = "starlette" },
+    { name = "uvicorn" },
 ]
 
 [package.metadata]
 requires-dist = [
     { name = "mcp", specifier = ">=1.2.0" },
     { name = "pyserial", specifier = ">=3.5" },
+    { name = "starlette", specifier = ">=0.40" },
+    { name = "uvicorn", specifier = ">=0.30" },
 ]
 
 [[package]]
