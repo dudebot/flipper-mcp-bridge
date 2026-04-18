@@ -70,6 +70,35 @@ def send_ir_signal(protocol: str, address: str, command: str) -> dict:
 
 
 @mcp.tool()
+def delete_ir_button(file: str, button: str) -> dict:
+    """Remove a named button from an .ir file (reads, filters, rewrites)."""
+    with _flipper() as f:
+        return f.ir_delete_button(file, button)
+
+
+@mcp.tool()
+def list_universal_remotes() -> list[str]:
+    """List the built-in universal IR remote names on this firmware (ac, tv, fans, ...)."""
+    with _flipper() as f:
+        return f.ir_universal_remotes()
+
+
+@mcp.tool()
+def list_universal_signals(remote: str) -> list[str]:
+    """List the signal names available for a built-in universal remote (e.g. POWER, VOL+)."""
+    with _flipper() as f:
+        return f.ir_universal_signals(remote)
+
+
+@mcp.tool()
+def send_universal_signal(remote: str, signal: str) -> dict:
+    """Transmit a named signal from a built-in universal remote (e.g. remote='ac', signal='OFF')."""
+    with _flipper() as f:
+        f.ir_universal_send(remote, signal)
+    return {"ok": True, "remote": remote, "signal": signal}
+
+
+@mcp.tool()
 def learn_ir_button(file: str, button: str, timeout_seconds: float = 30.0) -> dict:
     """Put Flipper in IR RX, wait for a single remote press (up to timeout_seconds), then
     append the captured signal as a named button to the given .ir file. Creates the file

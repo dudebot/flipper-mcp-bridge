@@ -13,6 +13,9 @@ Tested against **Momentum firmware (mntm-008)**. Any recent Flipper fork with th
 | `list_ir_buttons` | Parse a saved `.ir` file and return its buttons |
 | `send_ir_button` | Transmit a named button from a saved `.ir` file |
 | `send_ir_signal` | Transmit an ad-hoc parsed IR signal by MSB-first integer hex (e.g. `NECext DF02 EE11`) |
+| `list_universal_remotes` | List built-in universal IR remotes available on the firmware (ac, tv, fans, ...) |
+| `list_universal_signals` | List the signal names for a built-in universal remote |
+| `send_universal_signal` | Transmit a named signal from a built-in universal remote |
 | `learn_ir_button` | Put the Flipper in RX, capture the next remote press, append it to a `.ir` file |
 
 ## Setup (Windows host, WSL2)
@@ -67,11 +70,70 @@ You should see device info, a list of files under `/ext/infrared/`, and parsed c
 
 ## Running
 
-Standalone stdio:
+MCP stdio (for Claude Code, Cursor, etc.):
 
 ```bash
 uv run flipper-mcp-bridge
 ```
+
+HTTP REST API (for Home Assistant, `curl`, scripts):
+
+```bash
+uv run flipper-mcp-bridge --http --port 8765
+```
+
+Endpoints:
+
+| Method | Path | Body / Query |
+|---|---|---|
+| `GET` | `/health` | — |
+| `GET` | `/device` | — |
+| `GET` | `/ir/files` | `?dir=/ext/infrared` |
+| `GET` | `/ir/buttons` | `?file=/ext/infrared/Remote.ir` |
+| `POST` | `/ir/send-button` | `{"file": "...", "button": "..."}` |
+| `POST` | `/ir/send-signal` | `{"protocol": "...", "address": "...", "command": "..."}` |
+| `GET` | `/ir/universal/list` | `?remote=ac` (omit to list available remotes) |
+| `POST` | `/ir/universal/send` | `{"remote": "ac", "signal": "OFF"}` |
+| `POST` | `/ir/learn` | `{"file": "...", "button": "...", "timeout_seconds": 30}` |
+
+## Home Assistant integration
+
+### Deployment note: reachability from HA
+
+HA needs to be able to HTTP to the bridge. Two easy setups work out of the box:
+
+1. **Run the bridge on the same host as HA** (Pi/NUC/server with Flipper plugged in). HA hits `http://127.0.0.1:8765`. Simplest.
+2. **Run the bridge on any always-on Linux host on the LAN**. Start it with `--host 0.0.0.0` (the CLI prints a warning — there's no auth in v1, so only do this on a trusted LAN). HA hits `http://HOST:8765`.
+
+**WSL2 caveat**: WSL2 uses NAT — the WSL IP isn't reachable from other hosts on the LAN. Running the bridge inside WSL2 and expecting HA on a different device to reach it requires `netsh interface portproxy` port-forwarding on the Windows host, or running the bridge on the Windows host directly (Python + pyserial work fine on Windows).
+
+### Configuration
+
+Drop this into `configuration.yaml`:
+
+```yaml
+rest_command:
+  flipper_humidifier_toggle:
+    url: "http://FLIPPER_HOST:8765/ir/send-button"
+    method: POST
+    content_type: "application/json"
+    payload: '{"file":"/ext/infrared/Remote.ir","button":"Humid"}'
+
+  flipper_ac_off:
+    url: "http://FLIPPER_HOST:8765/ir/universal/send"
+    method: POST
+    content_type: "application/json"
+    payload: '{"remote":"ac","signal":"OFF"}'
+```
+
+Then in automations or scripts:
+
+```yaml
+action:
+  - service: rest_command.flipper_humidifier_toggle
+```
+
+For a switch-like entity, use a RESTful switch pointed at the same `/ir/send-button` endpoint (state is maintained by HA since the Flipper itself doesn't expose device state).
 
 ## Port selection
 
